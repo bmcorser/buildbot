@@ -28,6 +28,14 @@ try:
 except ImportError:
     import simplejson as json
 
+root = logging.getLogger()
+
+ch = logging.StreamHandler(sys.stdout)
+ch.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+ch.setFormatter(formatter)
+root.addHandler(ch)
+
 
 class GitHubBuildBot(resource.Resource):
 
@@ -48,20 +56,20 @@ class GitHubBuildBot(resource.Resource):
                 the http request object
         """
         try:
-            payload = json.loads(request.args['payload'][0])
-            user = payload['repository']['owner']['name']
+            payload = json.loads(request.content.read())
+            user = payload['sender']['login']
             repo = payload['repository']['name']
-            repo_url = payload['repository']['url']
+            repo_url = payload['repository']['git_url']
             self.private = payload['repository']['private']
             project = request.args.get('project', None)
             if project:
                 project = project[0]
-            logging.debug("Payload: " + str(payload))
+            root.debug("Payload: " + str(payload))
             self.process_change(payload, user, repo, repo_url, project)
         except Exception:
-            logging.error("Encountered an exception:")
+            root.error("Encountered an exception:")
             for msg in traceback.format_exception(*sys.exc_info()):
-                logging.error(msg.strip())
+                root.error(msg.strip())
 
     def process_change(self, payload, user, repo, repo_url, project):
         """
@@ -72,58 +80,33 @@ class GitHubBuildBot(resource.Resource):
                 Python Object that represents the JSON sent by GitHub Service
                 Hook.
         """
-        changes = []
-        newrev = payload['after']
-        refname = payload['ref']
+        action = payload['action']
 
-        # We only care about regular heads, i.e. branches
-        match = re.match(r"^refs\/heads\/(.+)$", refname)
-        if not match:
-            logging.info("Ignoring refname `%s': Not a branch" % refname)
-
-        branch = match.group(1)
-        # Find out if the branch was created, deleted or updated. Branches
-        # being deleted aren't really interesting.
-        if re.match(r"^0*$", newrev):
-            logging.info("Branch `%s' deleted, ignoring" % branch)
-        else:
-            for commit in payload['commits']:
-                files = []
-                files.extend(commit['added'])
-                files.extend(commit['modified'])
-                files.extend(commit['removed'])
-                change = {'revision': commit['id'],
-                          'revlink': commit['url'],
-                          'comments': commit['message'],
-                          'branch': branch,
-                          'who': commit['author']['name']
-                          + " <" + commit['author']['email'] + ">",
-                          'files': files,
-                          'repository': repo_url,
-                          'project': project,
-                          }
-                changes.append(change)
-
-        # Submit the changes, if any
-        if not changes:
-            logging.warning("No changes found")
-            return
+        pr = payload['pull_request']
+        branch = pr['head']['ref']
+        if action in ('synchronize', 'opened'):
+            change = [{'revision': pr['head']['sha'],
+                       'revlink': pr['html_url'],
+                       'comments': 'PR {0}'.format(action),
+                       'who': pr['user']['login'],
+                       'repository': repo_url,
+                       }]
 
         host, port = self.master.split(':')
         port = int(port)
 
         factory = pb.PBClientFactory()
-        deferred = factory.login(credentials.UsernamePassword("change",
-                                                              "changepw"))
+        deferred = factory.login(credentials.UsernamePassword("github",
+                                                              "webhooks"))
         reactor.connectTCP(host, port, factory)
         deferred.addErrback(self.connectFailed)
-        deferred.addCallback(self.connected, changes)
+        deferred.addCallback(self.connected, change)
 
     def connectFailed(self, error):
         """
         If connection is failed.  Logs the error.
         """
-        logging.error("Could not connect to master: %s"
+        root.error("Could not connect to master: %s"
                       % error.getErrorMessage())
         return error
 
@@ -131,16 +114,16 @@ class GitHubBuildBot(resource.Resource):
         """
         Sends changes from the commit to the buildmaster.
         """
-        logging.debug("addChange %s, %s" % (repr(remote), repr(changei)))
+        root.debug("addChange %s, %s" % (repr(remote), repr(changei)))
         try:
             change = changei.next()
         except StopIteration:
             remote.broker.transport.loseConnection()
             return None
 
-        logging.info("New revision: %s" % change['revision'][:8])
+        root.info("New revision: %s" % change['revision'][:8])
         for key, value in change.iteritems():
-            logging.debug("  %s: %s" % (key, value))
+            root.debug("  %s: %s" % (key, value))
 
         change['src'] = src
         deferred = remote.callRemote('addChange', change)
@@ -216,10 +199,12 @@ def main():
 
     site = server.Site(github_bot)
     reactor.listenTCP(options.port, site)
+    root.debug('running reactor')
     reactor.run()
 
     if options.pidfile and os.path.exists(options.pidfile):
         os.unlink(options.pidfile)
 
 if __name__ == '__main__':
+    root.debug('starting ...')
     main()
